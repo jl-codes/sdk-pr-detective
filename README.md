@@ -103,6 +103,71 @@ await agent.shutdown()
 | Permission handler | Auto-approve for autonomous operation |
 | Rich prompt content | PR metadata + diff sent as context |
 
+## CI / GitHub Actions
+
+Run PR Detective automatically on every PR with a GitHub Actions workflow. Use the `--ci` flag for clean markdown output (no colors/spinners).
+
+### Example workflow
+
+Add this to your repo at `.github/workflows/pr-detective.yml`:
+
+```yaml
+name: 🔍 PR Detective Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Cline CLI
+        run: npm install -g cline
+
+      - name: Authenticate Cline
+        env:
+          CLINE_API_KEY: ${{ secrets.CLINE_API_KEY }}
+        run: |
+          mkdir -p ~/.cline/data
+          echo '{"clineApiKey":"'"$CLINE_API_KEY"'"}' > ~/.cline/data/secrets.json
+          chmod 600 ~/.cline/data/secrets.json
+
+      - name: Clone & run PR Detective
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          git clone https://github.com/jl-codes/sdk-pr-detective.git /tmp/pr-detective
+          cd /tmp/pr-detective && npm install
+          npx tsx src/index.ts --ci "$PR_URL" > /tmp/review.md
+
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🔍 PR Detective Review"
+            echo "*Automated analysis powered by the [Cline SDK](https://docs.cline.bot/cline-sdk/overview)*"
+            echo "---"
+            cat /tmp/review.md
+          } > /tmp/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --body-file /tmp/comment.md
+```
+
+### Required secret
+
+Add `CLINE_API_KEY` to your repo's **Settings → Secrets → Actions**. This is your Cline API key for authentication.
+
 ## Project Structure
 
 ```

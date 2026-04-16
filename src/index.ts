@@ -4,6 +4,7 @@
  *
  * Usage:
  *   npx tsx src/index.ts https://github.com/owner/repo/pull/123
+ *   npx tsx src/index.ts --ci https://github.com/owner/repo/pull/123
  */
 
 import { ClineAgent } from "cline"
@@ -13,12 +14,23 @@ import { tmpdir } from "node:os"
 import { mkdtemp } from "node:fs/promises"
 import { join } from "node:path"
 
+// ─── CLI arg parsing ─────────────────────────────────────────────────────────
+
+const args = process.argv.slice(2)
+const ciMode = args.includes("--ci")
+const prUrl = args.find((a) => !a.startsWith("--"))
+
+// In CI mode, disable chalk colors for clean markdown output
+if (ciMode) {
+  chalk.level = 0
+}
+
 // ─── Parse PR URL ────────────────────────────────────────────────────────────
 
 function parsePrUrl(url: string): { owner: string; repo: string; number: number } {
   const match = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!match) {
-    console.error(chalk.red("✗ Invalid PR URL. Expected: https://github.com/owner/repo/pull/123"))
+    console.error("✗ Invalid PR URL. Expected: https://github.com/owner/repo/pull/123")
     process.exit(1)
   }
   return { owner: match[1], repo: match[2], number: parseInt(match[3], 10) }
@@ -85,29 +97,52 @@ function printPrSummary(meta: Awaited<ReturnType<typeof fetchPrData>>["meta"]) {
   console.log()
 }
 
+// ─── Logging helpers (silent in CI mode) ─────────────────────────────────────
+
+function log(msg: string) {
+  if (!ciMode) console.log(msg)
+}
+
+function logError(msg: string) {
+  if (!ciMode) console.error(msg)
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const prUrl = process.argv[2]
   if (!prUrl) {
-    console.log(banner)
-    console.error(chalk.yellow("Usage: npx tsx src/index.ts <github-pr-url>"))
-    console.error(chalk.gray("  Example: npx tsx src/index.ts https://github.com/jl-codes/platformio-mcp/pull/7"))
+    if (!ciMode) console.log(banner)
+    console.error("Usage: npx tsx src/index.ts [--ci] <github-pr-url>")
+    console.error("  Example: npx tsx src/index.ts https://github.com/jl-codes/platformio-mcp/pull/7")
+    console.error("  CI mode: npx tsx src/index.ts --ci https://github.com/jl-codes/platformio-mcp/pull/7")
     process.exit(1)
   }
 
-  console.log(banner)
+  if (!ciMode) console.log(banner)
 
   // 1. Parse and fetch PR data
   const { owner, repo, number } = parsePrUrl(prUrl)
-  const spinner = ora(chalk.cyan(`Fetching PR #${number} from ${owner}/${repo}...`)).start()
 
-  const { meta, diff } = await fetchPrData(owner, repo, number)
-  spinner.succeed(chalk.green(`Fetched PR #${number}`))
-  printPrSummary(meta)
+  let meta: Awaited<ReturnType<typeof fetchPrData>>["meta"]
+  let diff: string
+
+  if (ciMode) {
+    const data = await fetchPrData(owner, repo, number)
+    meta = data.meta
+    diff = data.diff
+  } else {
+    const spinner = ora(chalk.cyan(`Fetching PR #${number} from ${owner}/${repo}...`)).start()
+    const data = await fetchPrData(owner, repo, number)
+    meta = data.meta
+    diff = data.diff
+    spinner.succeed(chalk.green(`Fetched PR #${number}`))
+    printPrSummary(meta)
+  }
 
   // 2. Initialize Cline agent
-  const agentSpinner = ora(chalk.cyan("Starting Cline agent...")).start()
+  if (!ciMode) {
+    var agentSpinner = ora(chalk.cyan("Starting Cline agent...")).start()
+  }
 
   const cwd = await mkdtemp(join(tmpdir(), "pr-detective-"))
   const agent = new ClineAgent({})
@@ -127,36 +162,44 @@ async function main() {
     }
   })
 
-  agentSpinner.succeed(chalk.green("Cline agent ready"))
-  console.log()
+  if (!ciMode) {
+    agentSpinner!.succeed(chalk.green("Cline agent ready"))
+    console.log()
+  }
 
   // 3. Subscribe to streaming events
   const emitter = agent.emitterForSession(sessionId)
+  const output: string[] = []
   let isFirstChunk = true
 
   emitter.on("agent_message_chunk", (payload) => {
     if (payload.content.type === "text") {
-      if (isFirstChunk) {
-        console.log(chalk.bold.cyan("🔍 Detective's Report:"))
-        console.log(chalk.dim("─".repeat(50)))
-        isFirstChunk = false
+      if (ciMode) {
+        // In CI mode, collect output silently
+        output.push(payload.content.text)
+      } else {
+        if (isFirstChunk) {
+          console.log(chalk.bold.cyan("🔍 Detective's Report:"))
+          console.log(chalk.dim("─".repeat(50)))
+          isFirstChunk = false
+        }
+        process.stdout.write(payload.content.text)
       }
-      process.stdout.write(payload.content.text)
     }
   })
 
   emitter.on("agent_thought_chunk", (payload) => {
-    if (payload.content.type === "text") {
+    if (payload.content.type === "text" && !ciMode) {
       process.stdout.write(chalk.dim.italic(payload.content.text))
     }
   })
 
   emitter.on("tool_call", (payload) => {
-    console.log(chalk.yellow(`  🔧 ${payload.title}`))
+    if (!ciMode) console.log(chalk.yellow(`  🔧 ${payload.title}`))
   })
 
   emitter.on("error", (err) => {
-    console.error(chalk.red(`  ✗ Error: ${err.message}`))
+    console.error(`Error: ${err.message}`)
   })
 
   // 4. Build the prompt with PR context
@@ -208,21 +251,26 @@ One-line verdict.
 Keep your review focused and actionable. No need to use any tools — just analyze the diff directly and give your assessment.`
 
   // 5. Send prompt and wait for completion
-  console.log(chalk.cyan("\n🕵️  Analyzing PR...\n"))
+  log(chalk.cyan("\n🕵️  Analyzing PR...\n"))
 
   const { stopReason } = await agent.prompt({
     sessionId,
     prompt: [{ type: "text", text: prompt }],
   })
 
-  // 6. Clean up
-  console.log(chalk.dim("\n" + "─".repeat(50)))
-  console.log(chalk.gray(`\nDone (${stopReason})`))
+  // 6. Output and clean up
+  if (ciMode) {
+    // In CI mode, print the collected markdown to stdout
+    process.stdout.write(output.join(""))
+  } else {
+    console.log(chalk.dim("\n" + "─".repeat(50)))
+    console.log(chalk.gray(`\nDone (${stopReason})`))
+  }
 
   await agent.shutdown()
 }
 
 main().catch((err) => {
-  console.error(chalk.red(`\nFatal error: ${err.message}`))
+  console.error(`Fatal error: ${err.message}`)
   process.exit(1)
 })
