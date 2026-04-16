@@ -25,6 +25,12 @@ if (ciMode) {
   chalk.level = 0
 }
 
+// ─── Progress logging (always goes to stderr, visible in CI logs) ─────────────
+
+function progress(msg: string) {
+  process.stderr.write(`[pr-detective] ${msg}\n`)
+}
+
 // ─── Parse PR URL ────────────────────────────────────────────────────────────
 
 function parsePrUrl(url: string): { owner: string; repo: string; number: number } {
@@ -126,6 +132,8 @@ async function main() {
   let meta: Awaited<ReturnType<typeof fetchPrData>>["meta"]
   let diff: string
 
+  progress(`Fetching PR #${number} from ${owner}/${repo}...`)
+
   if (ciMode) {
     const data = await fetchPrData(owner, repo, number)
     meta = data.meta
@@ -139,20 +147,30 @@ async function main() {
     printPrSummary(meta)
   }
 
+  progress(`PR fetched: "${meta.title}" by ${meta.user.login} (+${meta.additions}/-${meta.deletions})`)
+
   // 2. Initialize Cline agent
   if (!ciMode) {
     var agentSpinner = ora(chalk.cyan("Starting Cline agent...")).start()
   }
 
+  progress("Creating temp directory...")
   const cwd = await mkdtemp(join(tmpdir(), "pr-detective-"))
+  progress(`Temp dir: ${cwd}`)
+
+  progress("Instantiating ClineAgent...")
   const agent = new ClineAgent({})
 
+  progress("Calling agent.initialize()...")
   await agent.initialize({
     protocolVersion: 1,
     clientCapabilities: {},
   })
+  progress("agent.initialize() complete")
 
+  progress("Calling agent.newSession()...")
   const { sessionId } = await agent.newSession({ cwd, mcpServers: [] })
+  progress(`agent.newSession() complete — sessionId: ${sessionId}`)
 
   // Auto-approve all tool calls (this is a read-only analysis demo)
   agent.setPermissionHandler(async (request) => {
@@ -175,8 +193,9 @@ async function main() {
   emitter.on("agent_message_chunk", (payload) => {
     if (payload.content.type === "text") {
       if (ciMode) {
-        // In CI mode, collect output silently
+        // In CI mode, collect output AND mirror to stderr for real-time visibility in logs
         output.push(payload.content.text)
+        process.stderr.write(payload.content.text)
       } else {
         if (isFirstChunk) {
           console.log(chalk.bold.cyan("🔍 Detective's Report:"))
@@ -195,10 +214,15 @@ async function main() {
   })
 
   emitter.on("tool_call", (payload) => {
-    if (!ciMode) console.log(chalk.yellow(`  🔧 ${payload.title}`))
+    if (ciMode) {
+      progress(`Tool call: ${payload.title}`)
+    } else {
+      console.log(chalk.yellow(`  🔧 ${payload.title}`))
+    }
   })
 
   emitter.on("error", (err) => {
+    progress(`Emitter error: ${err.message}`)
     console.error(`Error: ${err.message}`)
   })
 
@@ -250,13 +274,27 @@ One-line verdict.
 
 Keep your review focused and actionable. No need to use any tools — just analyze the diff directly and give your assessment.`
 
-  // 5. Send prompt and wait for completion
+  // 5. Send prompt and wait for completion (with timeout)
   log(chalk.cyan("\n🕵️  Analyzing PR...\n"))
 
-  const { stopReason } = await agent.prompt({
-    sessionId,
-    prompt: [{ type: "text", text: prompt }],
-  })
+  const TIMEOUT_MS = 8 * 60 * 1000 // 8 minutes — under the 10-min step limit
+
+  progress("Calling agent.prompt()...")
+
+  const { stopReason } = await Promise.race([
+    agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: prompt }],
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error("Timed out after 8 minutes waiting for agent response")),
+        TIMEOUT_MS,
+      ),
+    ),
+  ])
+
+  progress(`agent.prompt() complete — stopReason: ${stopReason}`)
 
   // 6. Output and clean up
   if (ciMode) {
@@ -267,10 +305,13 @@ Keep your review focused and actionable. No need to use any tools — just analy
     console.log(chalk.gray(`\nDone (${stopReason})`))
   }
 
+  progress("Shutting down agent...")
   await agent.shutdown()
+  progress("Done.")
 }
 
 main().catch((err) => {
+  progress(`Fatal error: ${err.message}`)
   console.error(`Fatal error: ${err.message}`)
   process.exit(1)
 })
