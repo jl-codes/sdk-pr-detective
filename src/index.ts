@@ -193,9 +193,9 @@ async function main() {
   emitter.on("agent_message_chunk", (payload) => {
     if (payload.content.type === "text") {
       if (ciMode) {
-        // In CI mode, collect output AND mirror to stderr for real-time visibility in logs
+        // In CI mode, collect output for final stdout write. Don't mirror to stderr —
+        // with 2>&1 in workflows it causes the review to appear multiple times.
         output.push(payload.content.text)
-        process.stderr.write(payload.content.text)
       } else {
         if (isFirstChunk) {
           console.log(chalk.bold.cyan("🔍 Detective's Report:"))
@@ -227,13 +227,13 @@ async function main() {
   })
 
   // 4. Build the prompt with PR context
-  // Truncate diff if it's extremely large (>100k chars) to stay within context limits
-  const maxDiffLen = 100_000
-  const truncatedDiff = diff.length > maxDiffLen ? diff.slice(0, maxDiffLen) + "\n\n... (diff truncated)" : diff
+  // Truncate diff to 50k chars — large enough to capture most PRs, short enough to finish in time
+  const maxDiffLen = 50_000
+  const truncatedDiff = diff.length > maxDiffLen ? diff.slice(0, maxDiffLen) + "\n\n... (diff truncated for brevity)" : diff
 
   const prompt = `You are PR Detective 🔍 — an expert code reviewer with a knack for clear, structured analysis.
 
-Analyze this GitHub Pull Request and provide a structured review. Be concise but thorough.
+Analyze this GitHub Pull Request and provide a structured review. Be concise — aim for ~400 words total.
 
 ## PR Information
 - **Title:** ${meta.title}
@@ -308,6 +308,10 @@ Keep your review focused and actionable. No need to use any tools — just analy
   progress("Shutting down agent...")
   await agent.shutdown()
   progress("Done.")
+
+  // Force exit — agent.shutdown() doesn't close the gRPC server's event loop,
+  // so the Node process hangs indefinitely without this.
+  process.exit(0)
 }
 
 main().catch((err) => {
