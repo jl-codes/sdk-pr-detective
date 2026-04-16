@@ -117,6 +117,12 @@ name: 🔍 PR Detective Review
 on:
   pull_request:
     types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_url:
+        description: "GitHub PR URL to analyze"
+        required: true
+        type: string
 
 permissions:
   pull-requests: write
@@ -138,35 +144,102 @@ jobs:
           CLINE_API_KEY: ${{ secrets.CLINE_API_KEY }}
         run: |
           mkdir -p ~/.cline/data
-          echo '{"clineApiKey":"'"$CLINE_API_KEY"'"}' > ~/.cline/data/secrets.json
+
+          # Write secrets — Cline API key
+          cat > ~/.cline/data/secrets.json <<EOF
+          {"clineApiKey":"$CLINE_API_KEY"}
+          EOF
           chmod 600 ~/.cline/data/secrets.json
 
-      - name: Clone & run PR Detective
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          # Write global state — provider + model config
+          # Without this, the SDK defaults to "anthropic" provider (which needs a different key)
+          cat > ~/.cline/data/globalState.json <<'EOF'
+          {
+            "actModeApiProvider": "cline",
+            "planModeApiProvider": "cline",
+            "actModeClineModelId": "anthropic/claude-sonnet-4.6",
+            "planModeClineModelId": "anthropic/claude-sonnet-4.6",
+            "actModeClineModelInfo": {
+              "maxTokens": 128000,
+              "contextWindow": 200000,
+              "supportsImages": true,
+              "supportsPromptCache": true,
+              "inputPrice": 3,
+              "outputPrice": 15
+            },
+            "planModeClineModelInfo": {
+              "maxTokens": 128000,
+              "contextWindow": 200000,
+              "supportsImages": true,
+              "supportsPromptCache": true,
+              "inputPrice": 3,
+              "outputPrice": 15
+            }
+          }
+          EOF
+
+      - name: Clone PR Detective
         run: |
           git clone https://github.com/jl-codes/sdk-pr-detective.git /tmp/pr-detective
-          cd /tmp/pr-detective && npm install
-          npx tsx src/index.ts --ci "$PR_URL" > /tmp/review.md
+          cd /tmp/pr-detective
+          npm install
 
-      - name: Post PR comment
+      - name: Resolve PR URL
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_URL="${{ github.event.inputs.pr_url }}"
+          else
+            PR_URL="${{ github.event.pull_request.html_url }}"
+          fi
+          PR_NUMBER=$(echo "$PR_URL" | grep -oP '\d+$')
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Run PR Detective
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          cd /tmp/pr-detective
+          # stdout = review markdown → tee saves to file AND streams to step log
+          # stderr = progress markers → visible in step log only
+          npx tsx src/index.ts --ci "$PR_URL" 2>/dev/stderr | tee /tmp/review.md
+
+      - name: Post PR Comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
             echo "## 🔍 PR Detective Review"
+            echo ""
             echo "*Automated analysis powered by the [Cline SDK](https://docs.cline.bot/cline-sdk/overview)*"
+            echo ""
             echo "---"
+            echo ""
             cat /tmp/review.md
           } > /tmp/comment.md
-          gh pr comment "${{ github.event.pull_request.number }}" \
+          gh pr comment "${{ steps.pr.outputs.number }}" \
             --repo "${{ github.repository }}" --body-file /tmp/comment.md
 ```
 
-### Required secret
+### Required secrets & config
 
-Add `CLINE_API_KEY` to your repo's **Settings → Secrets → Actions**. This is your Cline API key for authentication.
+| What | Where | Purpose |
+|------|-------|---------|
+| `CLINE_API_KEY` | **Settings → Secrets → Actions** | Your Cline API key for authentication |
+| `GITHUB_TOKEN` | Built-in (automatic) | Used for PR API access and posting comments |
+
+> **Important:** The `Authenticate Cline` step writes **both** `secrets.json` (API key) and `globalState.json` (provider + model config). Without `globalState.json`, the SDK silently defaults to the `anthropic` provider, which requires a different API key format.
+
+### Key design choices
+
+- **`continue-on-error: true`** on the detective step — ensures the PR comment is always posted, even if the review is partial (e.g., for very large PRs that hit the timeout)
+- **`2>/dev/stderr | tee`** — separates progress markers (stderr) from the review markdown (stdout), so debug info appears in the step log but not in the PR comment
+- **`workflow_dispatch` trigger** — lets you manually test the workflow by pasting any PR URL, without needing to open a new PR
+- **`process.exit(0)` in the script** — the Cline SDK's gRPC server keeps the Node event loop alive after `agent.shutdown()`; without an explicit exit, the step hangs until the timeout kills it
 
 ## Project Structure
 
